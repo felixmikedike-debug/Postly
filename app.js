@@ -377,7 +377,18 @@ async function getTodayPosterCount(userId) {
 // ==================== MIDDLEWARE ====================
 // Frontend is hosted in a separate repo — this server is API-only.
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+// `verify` stashes the exact raw bytes this process received BEFORE JSON
+// parsing/re-serialization touches them. Paystack signs those exact raw
+// bytes (and when this endpoint receives a FORWARDED webhook from another
+// app in the same Paystack account, that other app re-sends those same
+// original bytes untouched) - so re-deriving JSON.stringify(req.body) later
+// can drift from what was actually signed and cause valid webhooks to fail
+// signature verification. Only the webhook route reads req.rawBody; every
+// other route is unaffected.
+app.use(express.json({
+  limit: '2mb',
+  verify: function (req, res, buf) { req.rawBody = buf; }
+}));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
 const authLimiter = rateLimit({
@@ -626,11 +637,19 @@ app.post('/api/subscription/initiate', authenticateToken, async function (req, r
 
 app.post('/api/subscription/webhook', async function (req, res) {
   try {
+    // req.rawBody is the exact byte stream received (see the verify() hook
+    // on express.json() above) - whether that came straight from Paystack
+    // or was forwarded verbatim by another app sharing this Paystack
+    // account. Signing THAT, not a re-serialized JSON.stringify(req.body),
+    // is what makes this check reliable either way.
+    const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
+    const signatureHeader = req.headers['x-paystack-signature'];
+
     const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY)
-      .update(JSON.stringify(req.body))
+      .update(rawBody)
       .digest('hex');
 
-    if (hash !== req.headers['x-paystack-signature']) {
+    if (!signatureHeader || hash !== signatureHeader) {
       return res.status(401).send('Invalid signature');
     }
 
