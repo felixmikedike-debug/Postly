@@ -206,6 +206,18 @@ const ipDailySchema = new mongoose.Schema({
 }, { timestamps: true });
 ipDailySchema.index({ ip: 1, date: 1 }, { unique: true });
 
+// Permanently binds a device fingerprint to the FIRST free-tier account
+// that generates on it. Any other account trying to generate on the same
+// device is blocked outright — not rate-limited, blocked — until either
+// the original account subscribes or an admin clears the binding. This is
+// what actually prevents "hit my limit, make a new account" abuse, rather
+// than just slowing it down.
+const deviceBindingSchema = new mongoose.Schema({
+  fingerprint: { type: String, required: true, unique: true },
+  userId: { type: String, required: true },
+  boundAt: { type: Date, default: Date.now },
+}, { timestamps: true });
+
 const adminSettingsSchema = new mongoose.Schema({
   dailyPosterLimit: { type: Number, default: 5, min: 1 },   // free-tier posters/day per account
   ipPosterMultiplier: { type: Number, default: 3, min: 1 }, // free-tier posters/day per IP = dailyPosterLimit * this
@@ -227,6 +239,7 @@ adminSettingsSchema.statics.updateSettings = async function (updates) {
 const User = mongoose.model('User', userSchema);
 const PosterDaily = mongoose.model('PosterDaily', posterDailySchema);
 const IpDaily = mongoose.model('IpDaily', ipDailySchema);
+const DeviceBinding = mongoose.model('DeviceBinding', deviceBindingSchema);
 const AdminSettings = mongoose.model('AdminSettings', adminSettingsSchema);
 
 // ==================== IN-MEMORY (auth-only, small scale) ====================
@@ -382,6 +395,31 @@ function getTodayDateString() {
 function getClientIp(req) {
   const ip = req.ip || (req.socket && req.socket.remoteAddress) || '';
   return ip.replace(/^::ffff:/, '');
+}
+
+// Reads and validates the X-Client-Fingerprint header sent by fingerprint.js
+// (a 64-char lowercase hex SHA-256). Malformed or missing values are
+// treated as "no fingerprint" rather than rejected outright, so older
+// frontend builds that haven't picked up the header yet keep working —
+// they just fall back to the IP-only cap until they update.
+const FINGERPRINT_REGEX = /^[a-f0-9]{64}$/;
+function getClientFingerprint(req) {
+  const fp = req.headers['x-client-fingerprint'];
+  if (typeof fp !== 'string' || !FINGERPRINT_REGEX.test(fp)) return null;
+  return fp;
+}
+
+// Atomically binds a fingerprint to whichever userId first generates a
+// poster on it. findOneAndUpdate + upsert is atomic in MongoDB, so two
+// simultaneous first-time requests from the same device can't both "win"
+// and create conflicting bindings — the second one just reads back the
+// first one's binding. Returns the (possibly pre-existing) binding.
+async function getOrBindDevice(fingerprint, userId) {
+  return DeviceBinding.findOneAndUpdate(
+    { fingerprint: fingerprint },
+    { $setOnInsert: { fingerprint: fingerprint, userId: userId, boundAt: new Date() } },
+    { upsert: true, new: true }
+  );
 }
 
 async function incrementPosterCount(userId, n) {
@@ -551,6 +589,25 @@ app.get('/api/auth/me', authenticateToken, async function (req, res) {
       postersUsedToday: usedToday
     }
   });
+});
+
+// Lets the frontend check, BEFORE calling /generate, whether this device is
+// already locked to a different free account — so it can show a clear
+// message and disable the form instead of the person burning a request
+// into a 403. Takes the fingerprint from the same X-Client-Fingerprint
+// header /generate reads. Doesn't create a binding by itself (read-only) —
+// binding only happens on an actual successful-path /generate call.
+app.get('/api/device/status', authenticateToken, async function (req, res) {
+  const subscribed = hasActiveSubscription(req.user);
+  const clientFingerprint = getClientFingerprint(req);
+
+  if (subscribed || !clientFingerprint) {
+    return res.json({ fingerprintProvided: !!clientFingerprint, blocked: false });
+  }
+
+  const existing = await DeviceBinding.findOne({ fingerprint: clientFingerprint });
+  const blocked = !!existing && existing.userId !== req.user.id;
+  res.json({ fingerprintProvided: true, blocked: blocked });
 });
 
 app.get('/api/telegram/connect', authenticateToken, function (req, res) {
@@ -757,33 +814,53 @@ function renderAdminPanel(stats) {
   return '<!DOCTYPE html>\n' +
     '<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>Admin Panel</title>\n' +
     '<style>\n' +
-    'body { font-family: "Segoe UI", sans-serif; background: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }\n' +
+    'body { font-family: "Segoe UI", sans-serif; background: #121212; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px 0; }\n' +
     '.container { background: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); width: 90%; max-width: 600px; }\n' +
     'h1 { text-align: center; color: #ffd700; margin-bottom: 30px; }\n' +
-    '.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 30px; }\n' +
-    '.stat-box { background: #2d2d2d; padding: 20px; border-radius: 10px; text-align: center; }\n' +
-    '.stat-number { font-size: 2.5em; font-weight: bold; color: #00ff41; margin: 10px 0; }\n' +
-    '.stat-label { font-size: 1.1em; color: #aaa; }\n' +
+    'h2 { font-size: 1.1em; color: #ffd700; margin: 30px 0 6px; border-top: 1px solid #333; padding-top: 24px; }\n' +
+    '.stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 30px; }\n' +
+    '.stat-box { background: #2d2d2d; padding: 16px 10px; border-radius: 10px; text-align: center; }\n' +
+    '.stat-number { font-size: 2em; font-weight: bold; color: #00ff41; margin: 8px 0; }\n' +
+    '.stat-label { font-size: 0.95em; color: #aaa; }\n' +
     '.pool { text-align: center; margin: 15px 0; padding: 12px; background: #2d2d2d; border-radius: 8px; font-size: 0.95em; color: #8fd; }\n' +
     'label { display: block; margin: 20px 0 8px; font-size: 1.1em; }\n' +
-    'input[type="number"], input[type="password"] { width: 100%; padding: 12px; background: #2d2d2d; border: none; border-radius: 6px; color: white; font-size: 1em; margin-bottom: 15px; box-sizing: border-box; }\n' +
-    'button { width: 100%; padding: 14px; background: #ffd700; color: black; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; font-size: 1.1em; margin-top: 20px; }\n' +
+    'input[type="number"], input[type="password"], input[type="text"] { width: 100%; padding: 12px; background: #2d2d2d; border: none; border-radius: 6px; color: white; font-size: 1em; margin-bottom: 15px; box-sizing: border-box; font-family: monospace; }\n' +
+    'button { width: 100%; padding: 14px; background: #ffd700; color: black; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; font-size: 1.1em; margin-top: 10px; }\n' +
     'button:hover { background: #e6c200; }\n' +
+    'button.danger { background: #dc3545; color: white; }\n' +
+    'button.danger:hover { background: #b02a37; }\n' +
     '.hint { font-size: 0.85em; color: #999; margin-top: -10px; margin-bottom: 15px; }\n' +
+    '.msg { text-align: center; padding: 10px; border-radius: 8px; margin-bottom: 15px; font-size: 0.9em; }\n' +
+    '.msg.ok { background: #17331f; color: #7ee596; }\n' +
+    '.msg.err { background: #331717; color: #e57e7e; }\n' +
     '</style>\n</head>\n<body>\n<div class="container">\n<h1>Server Admin Panel</h1>\n' +
     '<div class="pool">Auth bot: ' + (authBotReady ? 'ready' : 'starting') + '</div>\n' +
+    (stats.message ? '<div class="msg ' + (stats.messageType || 'ok') + '">' + stats.message + '</div>\n' : '') +
     '<div class="stats">\n' +
     '<div class="stat-box"><div class="stat-number">' + stats.totalUsers + '</div><div class="stat-label">Total Users</div></div>\n' +
     '<div class="stat-box"><div class="stat-number">' + stats.payingUsers + '</div><div class="stat-label">Paying Users</div></div>\n' +
+    '<div class="stat-box"><div class="stat-number">' + stats.deviceBindings + '</div><div class="stat-label">Locked Devices</div></div>\n' +
     '</div>\n' +
+    '<h2>Limits</h2>\n' +
     '<form method="POST" action="/admin-limits">\n' +
     '<input type="hidden" name="password" value="' + stats.password + '">\n' +
+    '<input type="hidden" name="action" value="update_limits">\n' +
     '<label>Daily Posters per Account (Free)</label>\n' +
     '<input type="number" name="daily_posters" min="1" value="' + adminSettingsCache.dailyPosterLimit + '" required>\n' +
     '<label>Daily Posters per IP = per-account limit × this</label>\n' +
     '<div class="hint">Free-tier generations only. Current effective IP cap: ' + getIpDailyLimit() + '/day. Paying subscribers are never counted against this.</div>\n' +
     '<input type="number" name="ip_multiplier" min="1" value="' + adminSettingsCache.ipPosterMultiplier + '" required>\n' +
+    '<div class="hint">Device fingerprints are handled separately, below — each device is locked to one free account permanently, not a daily cap.</div>\n' +
     '<button type="submit">Update Limits</button>\n' +
+    '</form>\n' +
+    '<h2>Locked devices</h2>\n' +
+    '<div class="hint">Each fingerprint is permanently tied to the first free account that generated on it. Use this to release a device (e.g. a shared/family computer, or after confirming a false positive) so a different account can generate on it again.</div>\n' +
+    '<form method="POST" action="/admin-limits">\n' +
+    '<input type="hidden" name="password" value="' + stats.password + '">\n' +
+    '<input type="hidden" name="action" value="unbind_device">\n' +
+    '<label>Fingerprint to unlock</label>\n' +
+    '<input type="text" name="fingerprint" placeholder="64-char fingerprint hash" maxlength="64">\n' +
+    '<button type="submit" class="danger">Unlock this device</button>\n' +
     '</form>\n</div>\n</body>\n</html>';
 }
 
@@ -797,27 +874,40 @@ app.post('/admin-limits', async function (req, res) {
     return res.status(401).send(renderAdminLoginForm('Wrong password'));
   }
 
-  if (req.body.daily_posters === undefined) {
+  async function currentStats(extra) {
     const totalUsers = await User.countDocuments({});
     const payingUsers = await User.countDocuments({ isSubscribed: true, subscriptionEndDate: { $gt: new Date() } });
-    return res.send(renderAdminPanel({ totalUsers, payingUsers, password }));
+    const deviceBindings = await DeviceBinding.countDocuments({});
+    return Object.assign({ totalUsers, payingUsers, deviceBindings, password }, extra || {});
+  }
+
+  const action = req.body.action;
+
+  if (action === 'unbind_device') {
+    const fingerprint = typeof req.body.fingerprint === 'string' ? req.body.fingerprint.trim().toLowerCase() : '';
+    if (!fingerprint || fingerprint.length > 64) {
+      return res.status(400).send(renderAdminPanel(await currentStats({ message: 'Enter a fingerprint to unlock.', messageType: 'err' })));
+    }
+    const result = await DeviceBinding.deleteOne({ fingerprint: fingerprint });
+    const message = result.deletedCount > 0 ? 'Device unlocked — a new free account can now generate on it.' : 'No binding found for that fingerprint.';
+    return res.send(renderAdminPanel(await currentStats({ message: message, messageType: result.deletedCount > 0 ? 'ok' : 'err' })));
+  }
+
+  if (req.body.daily_posters === undefined) {
+    return res.send(renderAdminPanel(await currentStats()));
   }
 
   const newDaily = parseInt(req.body.daily_posters, 10);
   const newIpMultiplier = req.body.ip_multiplier !== undefined ? parseInt(req.body.ip_multiplier, 10) : adminSettingsCache.ipPosterMultiplier;
   if (isNaN(newDaily) || newDaily < 1 || isNaN(newIpMultiplier) || newIpMultiplier < 1) {
-    const totalUsers = await User.countDocuments({});
-    const payingUsers = await User.countDocuments({ isSubscribed: true, subscriptionEndDate: { $gt: new Date() } });
-    return res.status(400).send(renderAdminPanel({ totalUsers, payingUsers, password }));
+    return res.status(400).send(renderAdminPanel(await currentStats({ message: 'Please enter valid, positive numbers.', messageType: 'err' })));
   }
 
   await AdminSettings.updateSettings({ dailyPosterLimit: newDaily, ipPosterMultiplier: newIpMultiplier });
   adminSettingsCache = { dailyPosterLimit: newDaily, ipPosterMultiplier: newIpMultiplier };
   console.log('Admin limits updated:', adminSettingsCache);
 
-  const totalUsers = await User.countDocuments({});
-  const payingUsers = await User.countDocuments({ isSubscribed: true, subscriptionEndDate: { $gt: new Date() } });
-  res.send(renderAdminPanel({ totalUsers, payingUsers, password }));
+  res.send(renderAdminPanel(await currentStats({ message: 'Limits updated.', messageType: 'ok' })));
 });
 
 // ==================== POSTER GENERATION CORE (image only) ====================
@@ -1135,6 +1225,19 @@ app.get('/generate', authenticateToken, async function (req, res) {
       const ipUsedToday = await getTodayIpPosterCount(clientIp);
       if (ipUsedToday >= ipDailyLimit) {
         return res.status(403).json({ error: 'Daily poster limit reached for this network. Subscribe for unlimited posters.' });
+      }
+    }
+
+    // Device binding: hard rule, not a quota. The first free-tier account
+    // to generate on this fingerprint owns it. Any other account on the
+    // same device is blocked outright, every time, regardless of its own
+    // remaining daily allowance — that's what actually stops "make a new
+    // account" abuse instead of just slowing it down.
+    const clientFingerprint = getClientFingerprint(req);
+    if (!subscribed && clientFingerprint) {
+      const binding = await getOrBindDevice(clientFingerprint, req.user.id);
+      if (binding.userId !== req.user.id) {
+        return res.status(403).json({ error: 'This device has already generated posters on a different account. Each device is limited to one free account — subscribe to use additional accounts on this device.' });
       }
     }
 
