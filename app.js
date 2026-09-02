@@ -195,9 +195,21 @@ const posterDailySchema = new mongoose.Schema({
 }, { timestamps: true });
 posterDailySchema.index({ userId: 1, date: 1 }, { unique: true });
 
-const adminSettingsSchema = new mongoose.Schema({
-  dailyPosterLimit: { type: Number, default: 5, min: 1 },   // free-tier posters/day
+// Tracks free-tier poster generations per client IP per day, independent of
+// which account made the request. This is what stops the "hit my account
+// limit -> sign up again" abuse pattern: the cap follows the network, not
+// the account, so a fresh account on the same IP inherits the same cap.
+const ipDailySchema = new mongoose.Schema({
+  ip: { type: String, required: true },
+  date: { type: String, required: true },
+  count: { type: Number, default: 0 },
 }, { timestamps: true });
+ipDailySchema.index({ ip: 1, date: 1 }, { unique: true });
+
+const adminSettingsSchema = new mongoose.Schema({
+  dailyPosterLimit: { type: Number, default: 5, min: 1 },   // free-tier posters/day per account
+  ipPosterMultiplier: { type: Number, default: 3, min: 1 }, // free-tier posters/day per IP = dailyPosterLimit * this
+});
 
 adminSettingsSchema.statics.getSettings = async function () {
   let settings = await this.findOne();
@@ -214,12 +226,13 @@ adminSettingsSchema.statics.updateSettings = async function (updates) {
 
 const User = mongoose.model('User', userSchema);
 const PosterDaily = mongoose.model('PosterDaily', posterDailySchema);
+const IpDaily = mongoose.model('IpDaily', ipDailySchema);
 const AdminSettings = mongoose.model('AdminSettings', adminSettingsSchema);
 
 // ==================== IN-MEMORY (auth-only, small scale) ====================
 const resetTokens = new Map(); // resetToken -> { userId, code, expiresAt }
 
-let adminSettingsCache = { dailyPosterLimit: 5 };
+let adminSettingsCache = { dailyPosterLimit: 5, ipPosterMultiplier: 3 };
 
 // ==================== SINGLE TELEGRAM BOT (2FA ONLY) ====================
 const botPool = { authBot: null };
@@ -354,8 +367,21 @@ function getUserLimits(user) {
   return { dailyPosters: adminSettingsCache.dailyPosterLimit };
 }
 
+function getIpDailyLimit() {
+  return adminSettingsCache.dailyPosterLimit * (adminSettingsCache.ipPosterMultiplier || 3);
+}
+
 function getTodayDateString() {
   return new Date().toISOString().slice(0, 10);
+}
+
+// Resolves the real client IP. `trust proxy` is set to 3 above, so Express
+// already walks that many hops of X-Forwarded-For before landing on req.ip.
+// We just normalize the IPv4-mapped IPv6 form (::ffff:1.2.3.4) so the same
+// client doesn't get counted under two different-looking keys.
+function getClientIp(req) {
+  const ip = req.ip || (req.socket && req.socket.remoteAddress) || '';
+  return ip.replace(/^::ffff:/, '');
 }
 
 async function incrementPosterCount(userId, n) {
@@ -371,6 +397,22 @@ async function incrementPosterCount(userId, n) {
 async function getTodayPosterCount(userId) {
   const today = getTodayDateString();
   const record = await PosterDaily.findOne({ userId: userId, date: today });
+  return record ? record.count : 0;
+}
+
+async function incrementIpPosterCount(ip, n) {
+  const today = getTodayDateString();
+  const record = await IpDaily.findOneAndUpdate(
+    { ip: ip, date: today },
+    { $inc: { count: n } },
+    { upsert: true, new: true }
+  );
+  return record.count;
+}
+
+async function getTodayIpPosterCount(ip) {
+  const today = getTodayDateString();
+  const record = await IpDaily.findOne({ ip: ip, date: today });
   return record ? record.count : 0;
 }
 
@@ -395,6 +437,15 @@ const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Too many attempts' }
+});
+
+// Tighter, dedicated limiter for account creation. Login shares an IP with
+// many legitimate users far more often than registration does, so this is
+// deliberately stricter than authLimiter above.
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 3,
+  message: { error: 'Too many accounts created from this network. Please try again later.' }
 });
 
 // ==================== WEBHOOK ROUTE (auth bot only) ====================
@@ -428,7 +479,7 @@ const authenticateToken = async function (req, res, next) {
 };
 
 // ==================== AUTH ROUTES ====================
-app.post('/api/auth/register', authLimiter, async function (req, res) {
+app.post('/api/auth/register', registerLimiter, async function (req, res) {
   const nameCheck = validateName(req.body.fullName, 'Full name');
   if (!nameCheck.ok) return res.status(400).json({ error: nameCheck.error });
 
@@ -718,6 +769,7 @@ function renderAdminPanel(stats) {
     'input[type="number"], input[type="password"] { width: 100%; padding: 12px; background: #2d2d2d; border: none; border-radius: 6px; color: white; font-size: 1em; margin-bottom: 15px; box-sizing: border-box; }\n' +
     'button { width: 100%; padding: 14px; background: #ffd700; color: black; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; font-size: 1.1em; margin-top: 20px; }\n' +
     'button:hover { background: #e6c200; }\n' +
+    '.hint { font-size: 0.85em; color: #999; margin-top: -10px; margin-bottom: 15px; }\n' +
     '</style>\n</head>\n<body>\n<div class="container">\n<h1>Server Admin Panel</h1>\n' +
     '<div class="pool">Auth bot: ' + (authBotReady ? 'ready' : 'starting') + '</div>\n' +
     '<div class="stats">\n' +
@@ -726,8 +778,11 @@ function renderAdminPanel(stats) {
     '</div>\n' +
     '<form method="POST" action="/admin-limits">\n' +
     '<input type="hidden" name="password" value="' + stats.password + '">\n' +
-    '<label>Daily Posters per User (Free)</label>\n' +
+    '<label>Daily Posters per Account (Free)</label>\n' +
     '<input type="number" name="daily_posters" min="1" value="' + adminSettingsCache.dailyPosterLimit + '" required>\n' +
+    '<label>Daily Posters per IP = per-account limit × this</label>\n' +
+    '<div class="hint">Free-tier generations only. Current effective IP cap: ' + getIpDailyLimit() + '/day. Paying subscribers are never counted against this.</div>\n' +
+    '<input type="number" name="ip_multiplier" min="1" value="' + adminSettingsCache.ipPosterMultiplier + '" required>\n' +
     '<button type="submit">Update Limits</button>\n' +
     '</form>\n</div>\n</body>\n</html>';
 }
@@ -749,14 +804,15 @@ app.post('/admin-limits', async function (req, res) {
   }
 
   const newDaily = parseInt(req.body.daily_posters, 10);
-  if (isNaN(newDaily) || newDaily < 1) {
+  const newIpMultiplier = req.body.ip_multiplier !== undefined ? parseInt(req.body.ip_multiplier, 10) : adminSettingsCache.ipPosterMultiplier;
+  if (isNaN(newDaily) || newDaily < 1 || isNaN(newIpMultiplier) || newIpMultiplier < 1) {
     const totalUsers = await User.countDocuments({});
     const payingUsers = await User.countDocuments({ isSubscribed: true, subscriptionEndDate: { $gt: new Date() } });
     return res.status(400).send(renderAdminPanel({ totalUsers, payingUsers, password }));
   }
 
-  await AdminSettings.updateSettings({ dailyPosterLimit: newDaily });
-  adminSettingsCache = { dailyPosterLimit: newDaily };
+  await AdminSettings.updateSettings({ dailyPosterLimit: newDaily, ipPosterMultiplier: newIpMultiplier });
+  adminSettingsCache = { dailyPosterLimit: newDaily, ipPosterMultiplier: newIpMultiplier };
   console.log('Admin limits updated:', adminSettingsCache);
 
   const totalUsers = await User.countDocuments({});
@@ -1061,10 +1117,25 @@ app.get('/generate', authenticateToken, async function (req, res) {
     const ctaCheck = validateCapped(req.query.cta, 'cta', CTA_MAX_LENGTH, false);
     if (!ctaCheck.ok) return res.status(400).json({ error: ctaCheck.error });
 
+    const subscribed = hasActiveSubscription(req.user);
     const limits = getUserLimits(req.user);
     const usedToday = await getTodayPosterCount(req.user.id);
     if (limits.dailyPosters !== Infinity && usedToday >= limits.dailyPosters) {
       return res.status(403).json({ error: 'Daily poster limit reached. Subscribe for unlimited posters.' });
+    }
+
+    // IP-based cap: only counted/enforced for free-tier requests, so paying
+    // subscribers sharing a network (offices, campuses, cafes) are never
+    // blocked by it. This is what stops "hit my account limit -> sign up
+    // again" abuse — the cap follows the network, not the account, so a
+    // brand-new free account on an already-capped IP fails immediately.
+    const clientIp = getClientIp(req);
+    if (!subscribed && clientIp) {
+      const ipDailyLimit = getIpDailyLimit();
+      const ipUsedToday = await getTodayIpPosterCount(clientIp);
+      if (ipUsedToday >= ipDailyLimit) {
+        return res.status(403).json({ error: 'Daily poster limit reached for this network. Subscribe for unlimited posters.' });
+      }
     }
 
     const orientation = req.query.orientation === 'landscape' || req.query.orientation === 'square' ? req.query.orientation : 'portrait';
@@ -1075,6 +1146,9 @@ app.get('/generate', authenticateToken, async function (req, res) {
     });
 
     await incrementPosterCount(req.user.id, 1);
+    if (!subscribed && clientIp) {
+      await incrementIpPosterCount(clientIp, 1);
+    }
 
     res.set('Content-Type', 'image/jpeg');
     res.set('Content-Disposition', 'inline; filename="' + hookCheck.value.replace(/\s+/g, '_').slice(0, 40) + '.jpg"');
@@ -1115,7 +1189,7 @@ app.use(function (req, res) {
 async function loadAdminSettings() {
   try {
     const settings = await AdminSettings.getSettings();
-    adminSettingsCache = { dailyPosterLimit: settings.dailyPosterLimit };
+    adminSettingsCache = { dailyPosterLimit: settings.dailyPosterLimit, ipPosterMultiplier: settings.ipPosterMultiplier };
     console.log('Admin settings loaded from DB:', adminSettingsCache);
   } catch (err) {
     console.error('Failed to load admin settings:', err);
