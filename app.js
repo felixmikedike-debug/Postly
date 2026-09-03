@@ -94,7 +94,7 @@ if (!PEXELS_API_KEY && !PIXABAY_API_KEY) {
   console.warn('WARNING: PIXABAY_API_KEY not set — no fallback if Pexels rate-limits.');
 }
 
-const MONTHLY_PRICE_KOBO = 200000; // NGN 2,000/mo for unlimited posters — adjust to taste
+const MONTHLY_PRICE_KOBO = 500000; // NGN 5,000/mo for unlimited posters — adjust to taste
 
 // ==================== INPUT VALIDATION: LENGTH CAPS & CHARACTER RULES ====================
 const NAME_MAX_LENGTH = 80;
@@ -854,14 +854,45 @@ function renderAdminPanel(stats) {
     '<button type="submit">Update Limits</button>\n' +
     '</form>\n' +
     '<h2>Locked devices</h2>\n' +
-    '<div class="hint">Each fingerprint is permanently tied to the first free account that generated on it. Use this to release a device (e.g. a shared/family computer, or after confirming a false positive) so a different account can generate on it again.</div>\n' +
+    '<div class="hint">Each fingerprint is permanently tied to the first free account that generated on it. Look up an account by email to see which device(s) it owns, then unlock from there — you never need to already know the raw fingerprint.</div>\n' +
     '<form method="POST" action="/admin-limits">\n' +
     '<input type="hidden" name="password" value="' + stats.password + '">\n' +
-    '<input type="hidden" name="action" value="unbind_device">\n' +
-    '<label>Fingerprint to unlock</label>\n' +
-    '<input type="text" name="fingerprint" placeholder="64-char fingerprint hash" maxlength="64">\n' +
-    '<button type="submit" class="danger">Unlock this device</button>\n' +
-    '</form>\n</div>\n</body>\n</html>';
+    '<input type="hidden" name="action" value="lookup_device">\n' +
+    '<label>Find device(s) by account email</label>\n' +
+    '<input type="text" name="lookup_email" placeholder="user@example.com" value="' + (stats.lookupEmail ? escapeHtmlAttr(stats.lookupEmail) : '') + '">\n' +
+    '<button type="submit">Look up</button>\n' +
+    '</form>\n' +
+    (renderDeviceLookupResults(stats)) +
+    '</div>\n</body>\n</html>';
+}
+
+function escapeHtmlAttr(str) {
+  return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function renderDeviceLookupResults(stats) {
+  if (!stats.lookupPerformed) return '';
+  if (!stats.lookupUserFound) {
+    return '<div class="msg err">No account found for that email.</div>';
+  }
+  if (!stats.lookupBindings || stats.lookupBindings.length === 0) {
+    return '<div class="msg ok">Account found, but it has no locked device yet — it either hasn\'t generated a free poster, or it\'s subscribed (subscribers don\'t bind devices).</div>';
+  }
+  let html = '<div class="hint">Device(s) bound to this account:</div>';
+  stats.lookupBindings.forEach(function (b) {
+    html +=
+      '<div style="background:#2d2d2d;border-radius:8px;padding:12px;margin-bottom:10px;">' +
+      '<div style="font-family:monospace;font-size:0.8em;word-break:break-all;color:#8fd;margin-bottom:6px;">' + b.fingerprint + '</div>' +
+      '<div style="font-size:0.8em;color:#999;margin-bottom:10px;">Bound ' + new Date(b.boundAt).toLocaleString() + '</div>' +
+      '<form method="POST" action="/admin-limits" style="margin:0;">' +
+      '<input type="hidden" name="password" value="' + stats.password + '">' +
+      '<input type="hidden" name="action" value="unbind_device">' +
+      '<input type="hidden" name="fingerprint" value="' + b.fingerprint + '">' +
+      '<button type="submit" class="danger" style="margin-top:0;">Unlock this device</button>' +
+      '</form>' +
+      '</div>';
+  });
+  return html;
 }
 
 app.get('/admin-limits', function (req, res) {
@@ -891,6 +922,24 @@ app.post('/admin-limits', async function (req, res) {
     const result = await DeviceBinding.deleteOne({ fingerprint: fingerprint });
     const message = result.deletedCount > 0 ? 'Device unlocked — a new free account can now generate on it.' : 'No binding found for that fingerprint.';
     return res.send(renderAdminPanel(await currentStats({ message: message, messageType: result.deletedCount > 0 ? 'ok' : 'err' })));
+  }
+
+  if (action === 'lookup_device') {
+    const lookupEmail = typeof req.body.lookup_email === 'string' ? req.body.lookup_email.trim().toLowerCase() : '';
+    if (!lookupEmail || lookupEmail.length > EMAIL_MAX_LENGTH) {
+      return res.status(400).send(renderAdminPanel(await currentStats({ message: 'Enter an email to look up.', messageType: 'err' })));
+    }
+    const user = await User.findOne({ email: lookupEmail });
+    if (!user) {
+      return res.send(renderAdminPanel(await currentStats({ lookupPerformed: true, lookupUserFound: false, lookupEmail: lookupEmail })));
+    }
+    const bindings = await DeviceBinding.find({ userId: user.id }).sort({ boundAt: -1 });
+    return res.send(renderAdminPanel(await currentStats({
+      lookupPerformed: true,
+      lookupUserFound: true,
+      lookupEmail: lookupEmail,
+      lookupBindings: bindings.map(function (b) { return { fingerprint: b.fingerprint, boundAt: b.boundAt }; })
+    })));
   }
 
   if (req.body.daily_posters === undefined) {
