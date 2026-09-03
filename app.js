@@ -247,6 +247,33 @@ const resetTokens = new Map(); // resetToken -> { userId, code, expiresAt }
 
 let adminSettingsCache = { dailyPosterLimit: 5, ipPosterMultiplier: 3 };
 
+// Short-lived cache for authenticated user lookups. The dashboard fires
+// several authenticated requests back-to-back on page load (me,
+// subscription status, telegram connect, device status) — without this,
+// each one independently re-fetches the same user from Mongo within the
+// same few hundred milliseconds. A short TTL is enough to dedupe that
+// burst without meaningfully risking stale reads. Every code path that
+// writes to a user document MUST call invalidateUserCache(user.id)
+// immediately after saving, or callers can briefly see stale data.
+const USER_CACHE_TTL_MS = 5000;
+const userCache = new Map(); // userId -> { user, expiresAt }
+
+function cacheUser(user) {
+  userCache.set(user.id, { user: user, expiresAt: Date.now() + USER_CACHE_TTL_MS });
+}
+function getCachedUser(userId) {
+  const entry = userCache.get(userId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    userCache.delete(userId);
+    return null;
+  }
+  return entry.user;
+}
+function invalidateUserCache(userId) {
+  userCache.delete(userId);
+}
+
 // ==================== SINGLE TELEGRAM BOT (2FA ONLY) ====================
 const botPool = { authBot: null };
 
@@ -336,6 +363,7 @@ function registerAuthBotHandlers(authBot) {
     user.telegramChatId = chatId;
     user.isTelegramConnected = true;
     await user.save();
+    invalidateUserCache(user.id);
 
     await ctx.replyWithHTML('<b>Telegram 2FA Connected Successfully!</b>\n\nYou will receive login codes here.');
   });
@@ -507,8 +535,12 @@ const authenticateToken = async function (req, res, next) {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const user = await User.findOne({ id: decoded.userId });
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    let user = getCachedUser(decoded.userId);
+    if (!user) {
+      user = await User.findOne({ id: decoded.userId });
+      if (!user) return res.status(404).json({ error: 'User not found' });
+      cacheUser(user);
+    }
     req.user = user;
     next();
   } catch (err) {
@@ -610,6 +642,57 @@ app.get('/api/device/status', authenticateToken, async function (req, res) {
   res.json({ fingerprintProvided: true, blocked: blocked });
 });
 
+// Bundles everything the dashboard needs on page load — account info,
+// subscription status, Telegram connect link, and device-lock status —
+// into ONE authenticated round trip instead of four. This is the biggest
+// lever on perceived dashboard load time: each separate call pays its own
+// network round-trip cost (worse than the DB query itself on a typical
+// connection), and req.user is already resolved once by authenticateToken
+// (and cached — see userCache above) so none of this needs a second fetch.
+app.get('/api/dashboard/bootstrap', authenticateToken, async function (req, res) {
+  const subscribed = hasActiveSubscription(req.user);
+  const limits = getUserLimits(req.user);
+  const clientFingerprint = getClientFingerprint(req);
+
+  const [usedToday, deviceBinding] = await Promise.all([
+    getTodayPosterCount(req.user.id),
+    (!subscribed && clientFingerprint) ? DeviceBinding.findOne({ fingerprint: clientFingerprint }) : Promise.resolve(null)
+  ]);
+
+  const deviceBlocked = !!deviceBinding && deviceBinding.userId !== req.user.id;
+
+  let telegramConnect = null;
+  if (!req.user.isTelegramConnected) {
+    const bot = botPool.authBot;
+    if (bot && bot.username) {
+      telegramConnect = { startLink: 'https://t.me/' + bot.username + '?start=' + req.user.id, botUsername: '@' + bot.username };
+    }
+  }
+
+  res.json({
+    user: {
+      id: req.user.id,
+      fullName: req.user.fullName,
+      email: req.user.email,
+      isTelegramConnected: req.user.isTelegramConnected,
+      subscribed: subscribed,
+      subscriptionEndDate: req.user.subscriptionEndDate || null,
+      dailyPosterLimit: limits.dailyPosters === Infinity ? null : limits.dailyPosters,
+      postersUsedToday: usedToday
+    },
+    subscription: {
+      subscribed: subscribed,
+      plan: subscribed ? 'premium-monthly' : 'free',
+      endDate: req.user.subscriptionEndDate || null,
+      daysLeft: subscribed
+        ? Math.ceil((new Date(req.user.subscriptionEndDate) - new Date()) / (1000 * 60 * 60 * 24))
+        : 0
+    },
+    telegramConnect: telegramConnect,
+    device: { fingerprintProvided: !!clientFingerprint, blocked: deviceBlocked }
+  });
+});
+
 app.get('/api/telegram/connect', authenticateToken, function (req, res) {
   const bot = botPool.authBot;
   if (!bot || !bot.username) {
@@ -626,6 +709,7 @@ app.post('/api/auth/disconnect-telegram', authenticateToken, async function (req
   req.user.telegramChatId = null;
   req.user.isTelegramConnected = false;
   await req.user.save();
+  invalidateUserCache(req.user.id);
   res.json({ success: true, message: 'Telegram 2FA disconnected.' });
 });
 
@@ -694,6 +778,7 @@ app.post('/api/auth/reset-password', async function (req, res) {
 
   user.password = await bcrypt.hash(newPassword, 12);
   await user.save();
+  invalidateUserCache(user.id);
   resetTokens.delete(resetToken);
 
   res.json({ success: true, message: 'Password reset successful' });
@@ -735,6 +820,7 @@ app.post('/api/subscription/initiate', authenticateToken, async function (req, r
 
     req.user.pendingPaymentReference = reference;
     await req.user.save();
+    invalidateUserCache(req.user.id);
 
     res.json({ success: true, authorizationUrl: authorization_url, reference: reference });
   } catch (error) {
@@ -781,6 +867,7 @@ app.post('/api/subscription/webhook', async function (req, res) {
       user.subscriptionPlan = 'premium-monthly';
       user.pendingPaymentReference = undefined;
       await user.save();
+      invalidateUserCache(user.id);
 
       console.log('Subscription activated for ' + user.email + ' (ref: ' + reference + ')');
     }
