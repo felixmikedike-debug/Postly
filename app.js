@@ -47,7 +47,7 @@ const BUILD_TAG = 'poster-app-image-only-2026-08-29-v1';
 const app = express();
 console.log('=== BUILD TAG: ' + BUILD_TAG + ' ===');
 const PORT = process.env.PORT || 3000;
-app.set('trust proxy', 3);
+app.set('trust proxy', 1);
 
 app.use(function (req, res, next) {
   res.setHeader('X-App-Build', BUILD_TAG);
