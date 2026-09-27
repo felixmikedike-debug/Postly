@@ -1,6 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 // Marketing Poster Generator API — IMAGE ONLY (no embedded frontend)
 // Search query in -> Pexels stock photo -> branded JPEG
+// OR user-uploaded custom photo (direct-to-bucket via presigned URL) -> branded JPEG
 // Frontend is hosted in a separate repo; this process is API-only.
 //
 // Auth & billing:
@@ -9,9 +10,33 @@
 //   - Paystack subscription: free tier limited posters/day, paid unlimited
 //   - Admin panel at /admin-limits (password protected)
 //
+// Custom image uploads (using Backblaze B2's S3-compatible API):
+//   - Browser PUTs the raw file straight to the bucket using a short-lived
+//     presigned URL — the bytes never pass through this server.
+//   - The bucket must be PRIVATE. At generate time, the server fetches the
+//     object back itself using its own credentials (never a client-given
+//     URL), so there's no SSRF surface and no public exposure of uploads.
+//   - Backblaze B2 setup:
+//     1. B2 Cloud Storage -> Buckets -> your bucket -> note the "Endpoint"
+//        shown there, e.g. s3.us-west-004.backblazeb2.com. R2_ENDPOINT is
+//        that value with https:// in front — nothing else in the path.
+//     2. Account -> Application Keys -> Add a New Application Key. The
+//        "keyID" it gives you is R2_ACCESS_KEY_ID; the "applicationKey" is
+//        R2_SECRET_ACCESS_KEY (shown once — copy it immediately).
+//     3. R2_REGION is normally auto-detected from the endpoint's own
+//        hostname (the "us-west-004" part) — only set it explicitly if
+//        you hit SignatureDoesNotMatch errors.
+//     4. CORS: your bucket -> Bucket Settings -> CORS Rules. Required for
+//        the browser's direct PUT to succeed at all — without it, uploads
+//        fail silently in the browser and your server logs show nothing,
+//        because the request never reaches this server.
+//   - Also works with Cloudflare R2, MinIO, or AWS S3 itself the same way,
+//     just with a different R2_ENDPOINT host.
+//
 // Setup:
 //   npm install express bcryptjs jsonwebtoken cors uuid express-rate-limit
 //               telegraf mongoose axios node-fetch@2 sharp dotenv
+//               @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
 //   .env:
 //     PORT=3000
 //     MONGODB_URI=mongodb://localhost:27017/postergen
@@ -23,6 +48,12 @@
 //     PAYSTACK_SECRET_KEY=...
 //     PEXELS_API_KEY=...
 //     PIXABAY_API_KEY=...          (fallback when Pexels is rate-limited / fails)
+//     R2_ENDPOINT=...              (Backblaze B2 example: https://s3.us-west-004.backblazeb2.com)
+//     R2_ACCESS_KEY_ID=...         (B2 Application Key's "keyID")
+//     R2_SECRET_ACCESS_KEY=...     (B2 Application Key's "applicationKey")
+//     R2_BUCKET=...                (private bucket — custom-image uploads only unlock when this is set)
+//     R2_REGION=...                (optional — only needed if auto-detection from R2_ENDPOINT gets it wrong)
+//     UPLOAD_ALLOWED_ORIGIN=...    (optional — your frontend's exact origin, e.g. https://yourapp.com. Defaults to "*" (every origin) if unset — the server applies this to the bucket's CORS rule automatically on startup, no manual dashboard step needed.)
 //   node app.js
 //   API root: GET http://localhost:3000/
 // ─────────────────────────────────────────────────────────────────────────
@@ -41,6 +72,8 @@ const axios = require('axios');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
 const sharp = require('sharp');
+const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectCommand, PutBucketCorsCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const BUILD_TAG = 'poster-app-image-only-2026-08-29-v1';
 
@@ -94,7 +127,107 @@ if (!PEXELS_API_KEY && !PIXABAY_API_KEY) {
   console.warn('WARNING: PIXABAY_API_KEY not set — no fallback if Pexels rate-limits.');
 }
 
-const MONTHLY_PRICE_KOBO = 200000; // NGN 2,000/mo for unlimited posters — adjust to taste
+// ==================== OBJECT STORAGE (custom image uploads) ====================
+// S3-compatible client — works with Cloudflare R2, Backblaze B2, MinIO, or
+// AWS S3 itself, just by pointing R2_ENDPOINT at the right host. Custom
+// image upload is an optional feature: if these aren't set (or aren't
+// valid), the rest of the app runs fine, the upload endpoints just return
+// 503 — but we validate and LOG the reason at startup, rather than only
+// discovering a malformed value the first time someone tries to upload.
+//
+// NOTE ON REGION: this matters more than it looks like it should. SigV4
+// (the signing scheme presigned URLs use) includes the region as part of
+// what gets signed. Cloudflare R2 special-cases the literal string "auto"
+// and ignores it. Backblaze B2's S3-compatible endpoint embeds a REAL
+// region in its hostname (e.g. s3.us-west-004.backblazeb2.com — the
+// "us-west-004" part) and requires that exact value; get it wrong and
+// every presigned URL fails with SignatureDoesNotMatch, which looks
+// exactly like a bad access key but isn't. We derive it automatically
+// below so this isn't something you have to get right by hand.
+function cleanEnvVar(raw) {
+  // .env values pasted from a dashboard commonly carry a trailing newline,
+  // wrapping quotes, or trailing slash — any of which breaks `new URL(...)`
+  // with a bare "Invalid URL" that's otherwise very hard to diagnose.
+  if (typeof raw !== 'string') return raw;
+  return raw.trim().replace(/^['"]|['"]$/g, '');
+}
+
+function deriveS3Region(host, explicitRegion) {
+  if (explicitRegion) return explicitRegion; // R2_REGION always wins if set
+  const b2Match = host.match(/^s3\.([a-z0-9-]+)\.backblazeb2\.com$/i);
+  if (b2Match) return b2Match[1]; // e.g. "us-west-004"
+  if (/\.r2\.cloudflarestorage\.com$/i.test(host)) return 'auto';
+  return 'auto'; // best-effort default for other providers (e.g. MinIO) — override with R2_REGION if signing fails
+}
+
+const R2_ENDPOINT_RAW = cleanEnvVar(process.env.R2_ENDPOINT);
+const R2_ENDPOINT = R2_ENDPOINT_RAW ? R2_ENDPOINT_RAW.replace(/\/+$/, '') : R2_ENDPOINT_RAW; // strip trailing slash(es)
+const R2_ACCESS_KEY_ID = cleanEnvVar(process.env.R2_ACCESS_KEY_ID);
+const R2_SECRET_ACCESS_KEY = cleanEnvVar(process.env.R2_SECRET_ACCESS_KEY);
+const R2_BUCKET = cleanEnvVar(process.env.R2_BUCKET);
+const R2_REGION_OVERRIDE = cleanEnvVar(process.env.R2_REGION); // optional explicit override
+
+let R2_CONFIGURED = false;
+let R2_REGION = 'auto';
+if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
+  const missing = [
+    !R2_ENDPOINT && 'R2_ENDPOINT',
+    !R2_ACCESS_KEY_ID && 'R2_ACCESS_KEY_ID',
+    !R2_SECRET_ACCESS_KEY && 'R2_SECRET_ACCESS_KEY',
+    !R2_BUCKET && 'R2_BUCKET'
+  ].filter(Boolean);
+  console.warn('WARNING: custom image upload disabled — missing env var(s): ' + missing.join(', '));
+} else {
+  try {
+    const parsed = new URL(R2_ENDPOINT);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new Error('endpoint must start with http:// or https:// (got "' + parsed.protocol + '")');
+    }
+    if (parsed.pathname && parsed.pathname !== '/') {
+      // A path segment here almost always means someone pasted the
+      // per-bucket API URL (which includes the bucket name) instead of the
+      // account/region-level endpoint — R2_BUCKET is a separate field.
+      console.warn('WARNING: R2_ENDPOINT has a path ("' + parsed.pathname + '") — did you paste a bucket-specific URL instead of the account/region endpoint? For Cloudflare R2: https://<account_id>.r2.cloudflarestorage.com — for Backblaze B2: https://s3.<region>.backblazeb2.com — no trailing path either way. Bucket name belongs in R2_BUCKET.');
+    }
+    R2_REGION = deriveS3Region(parsed.host, R2_REGION_OVERRIDE);
+    R2_CONFIGURED = true;
+    console.log('S3-compatible storage configured — endpoint host: ' + parsed.host + ', region: ' + R2_REGION + ', bucket: ' + R2_BUCKET);
+  } catch (err) {
+    console.error('ERROR: R2_ENDPOINT is not a valid URL ("' + R2_ENDPOINT_RAW + '"): ' + err.message + '. Custom image upload is disabled until this is fixed.');
+    R2_CONFIGURED = false;
+  }
+}
+
+const s3Client = R2_CONFIGURED ? new S3Client({
+  region: R2_REGION,
+  endpoint: R2_ENDPOINT,
+  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+  forcePathStyle: true,
+  // Newer @aws-sdk/client-s3 versions attach a CRC32 checksum to S3
+  // requests BY DEFAULT (as of the SDK's "flexible checksums" change).
+  // Backblaze B2's SigV4 implementation doesn't handle that the same way
+  // real AWS S3 does, so the signature comes out invalid — this produces
+  // exactly "AccessDenied: Signature validation failed" on PutObject, even
+  // with fully correct credentials/region/bucket. Setting these back to
+  // "WHEN_REQUIRED" restores the pre-default opt-in behavior, which is
+  // what every S3-compatible, non-AWS provider (B2, R2, MinIO) expects.
+  requestChecksumCalculation: 'WHEN_REQUIRED',
+  responseChecksumValidation: 'WHEN_REQUIRED'
+}) : null;
+
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024; // 8MB — generous for a phone photo, small enough to keep memory use sane
+const UPLOAD_PRESIGN_TTL_SECONDS = 300; // presigned PUT URL is only valid for 5 minutes
+const ALLOWED_UPLOAD_MIME = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
+
+// uploads/{userId}/{uuid}.{ext} — userId is itself a uuidv4 (see userSchema),
+// so this fully constrains the key shape and prevents path traversal or one
+// user referencing another user's upload.
+const UPLOAD_KEY_REGEX = /^uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(jpg|png|webp)$/;
+function isOwnUploadKey(key, userId) {
+  return typeof key === 'string' && UPLOAD_KEY_REGEX.test(key) && key.startsWith('uploads/' + userId + '/');
+}
+
+const MONTHLY_PRICE_KOBO = 500000; // NGN 5,000/mo for unlimited posters — adjust to taste
 
 // ==================== INPUT VALIDATION: LENGTH CAPS & CHARACTER RULES ====================
 const NAME_MAX_LENGTH = 80;
@@ -1306,12 +1439,17 @@ function buildOverlaySvg(opts) {
 }
 
 async function generatePosterImage(opts) {
-  const photoUrl = opts.photoUrl, hook = opts.hook, copy = opts.copy, cta = opts.cta;
+  const hook = opts.hook, copy = opts.copy, cta = opts.cta;
   const layout = opts.layout || LAYOUT_POST;
 
-  const photoRes = await fetch(photoUrl);
-  if (!photoRes.ok) throw new Error('Failed to download photo: ' + photoRes.status);
-  const photoBuffer = Buffer.from(await photoRes.arrayBuffer());
+  // Either a ready buffer (custom upload, already fetched from R2) or a URL
+  // to download (stock photo from Pexels/Pixabay) — exactly one is passed.
+  let photoBuffer = opts.photoBuffer;
+  if (!photoBuffer) {
+    const photoRes = await fetch(opts.photoUrl);
+    if (!photoRes.ok) throw new Error('Failed to download photo: ' + photoRes.status);
+    photoBuffer = Buffer.from(await photoRes.arrayBuffer());
+  }
 
   const photoResized = await sharp(photoBuffer)
     .resize(layout.width, layout.photoHeight, { fit: 'cover' })
@@ -1330,11 +1468,100 @@ async function generatePosterImage(opts) {
     .toBuffer();
 }
 
+// Fetches a previously-uploaded custom image back from R2/B2 using the
+// SERVER's own credentials — never a client-supplied URL, so there's no
+// SSRF surface here. HeadObject first, so an oversized object is rejected
+// without ever pulling its bytes into memory.
+async function fetchUploadedImageBuffer(key) {
+  const head = await s3Client.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+  if (typeof head.ContentLength === 'number' && head.ContentLength > MAX_UPLOAD_BYTES) {
+    const err = new Error('Uploaded image is too large.');
+    err.status = 413;
+    throw err;
+  }
+
+  const obj = await s3Client.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+  const chunks = [];
+  for await (const chunk of obj.Body) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+// Deletes an uploaded image from R2/B2 once it's been composited into a
+// poster — uploads are single-use, so nothing stays in the bucket longer
+// than it takes to generate the one poster it was uploaded for. Best-effort:
+// a delete failure here must never fail the actual /generate response, since
+// the poster was already successfully created — it just logs for cleanup.
+async function deleteUploadedImage(key) {
+  try {
+    await s3Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+  } catch (err) {
+    console.error('Failed to delete uploaded image ' + key + ' after use:', err.message);
+  }
+}
+
 // ==================== POSTER ROUTES (authenticated) ====================
+
+// Modest per-account limiter on presign requests — these are cheap to call
+// but each one reserves a slot for an upload, so unrestricted calls could
+// be used to fill the bucket with junk even if nothing ever gets generated.
+const presignLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  message: { error: 'Too many upload requests. Please try again later.' },
+  keyGenerator: function (req) { return req.user ? req.user.id : getClientIp(req); }
+});
+
+// Issues a short-lived presigned PUT URL so the browser can upload a custom
+// photo DIRECTLY to the bucket — the bytes never pass through this server.
+// The key is scoped under uploads/{userId}/ so ownership is enforced purely
+// by key shape (see isOwnUploadKey), with no separate ACL bookkeeping needed.
+app.post('/api/uploads/presign', authenticateToken, presignLimiter, async function (req, res) {
+  if (!R2_CONFIGURED) return res.status(503).json({ error: 'Custom image upload is not configured on this server.' });
+
+  const contentType = req.body.contentType;
+  const ext = ALLOWED_UPLOAD_MIME[contentType];
+  if (!ext) {
+    return res.status(400).json({ error: 'Unsupported image type. Use JPEG, PNG, or WebP.' });
+  }
+
+  const key = 'uploads/' + req.user.id + '/' + uuidv4() + '.' + ext;
+
+  try {
+    const command = new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, ContentType: contentType });
+    const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: UPLOAD_PRESIGN_TTL_SECONDS });
+    res.json({ uploadUrl: uploadUrl, key: key, expiresIn: UPLOAD_PRESIGN_TTL_SECONDS, maxBytes: MAX_UPLOAD_BYTES, contentType: contentType });
+  } catch (err) {
+    // Log everything useful: which error type it was, the full message,
+    // and the (non-secret) config that produced it — "err.message" alone
+    // is often just "Invalid URL" with zero clue about which URL or why.
+    console.error(
+      'Presign error — name: ' + err.name +
+      ', message: ' + err.message +
+      ', R2_ENDPOINT: "' + R2_ENDPOINT + '"' +
+      ', R2_REGION: "' + R2_REGION + '"' +
+      ', R2_BUCKET: "' + R2_BUCKET + '"' +
+      (err.stack ? '\n' + err.stack : '')
+    );
+    res.status(500).json({ error: 'Could not prepare upload.' });
+  }
+});
+
 // Generates and returns the JPEG directly. Counts against the daily quota.
 app.get('/generate', authenticateToken, async function (req, res) {
   try {
-    const queryCheck = validateCapped(req.query.query, 'query', QUERY_MAX_LENGTH, true);
+    // Either a stock-photo search query, or a previously-uploaded custom
+    // image key — exactly one drives the poster's background photo.
+    const imageKey = typeof req.query.imageKey === 'string' ? req.query.imageKey.trim() : '';
+    const usingCustomImage = imageKey.length > 0;
+
+    if (usingCustomImage) {
+      if (!R2_CONFIGURED) return res.status(503).json({ error: 'Custom image upload is not configured on this server.' });
+      if (!isOwnUploadKey(imageKey, req.user.id)) {
+        return res.status(400).json({ error: 'Invalid or unrecognized image reference.' });
+      }
+    }
+
+    const queryCheck = validateCapped(req.query.query, 'query', QUERY_MAX_LENGTH, !usingCustomImage);
     if (!queryCheck.ok) return res.status(400).json({ error: queryCheck.error });
     const hookCheck = validateCapped(req.query.hook, 'hook', HOOK_MAX_LENGTH, true);
     if (!hookCheck.ok) return res.status(400).json({ error: hookCheck.error });
@@ -1379,10 +1606,33 @@ app.get('/generate', authenticateToken, async function (req, res) {
 
     const orientation = req.query.orientation === 'landscape' || req.query.orientation === 'square' ? req.query.orientation : 'portrait';
 
-    const photo = await searchStockPhoto(queryCheck.value, { orientation: orientation });
-    const imageBuffer = await generatePosterImage({
-      photoUrl: photo.photoUrl, hook: hookCheck.value, copy: copyCheck.value, cta: ctaCheck.value, layout: LAYOUT_POST
-    });
+    let imageBuffer;
+    if (usingCustomImage) {
+      let photoBuffer;
+      try {
+        photoBuffer = await fetchUploadedImageBuffer(imageKey);
+      } catch (err) {
+        if (err.name === 'NoSuchKey' || err.$metadata && err.$metadata.httpStatusCode === 404) {
+          return res.status(404).json({ error: 'Uploaded image not found or expired. Please upload it again.' });
+        }
+        if (err.status === 413) {
+          return res.status(413).json({ error: err.message });
+        }
+        throw err;
+      }
+      imageBuffer = await generatePosterImage({
+        photoBuffer: photoBuffer, hook: hookCheck.value, copy: copyCheck.value, cta: ctaCheck.value, layout: LAYOUT_POST
+      });
+      // The poster is composited and in memory now — the source upload has
+      // served its purpose and gets cleaned up immediately rather than
+      // waiting on a bucket lifecycle rule.
+      await deleteUploadedImage(imageKey);
+    } else {
+      const photo = await searchStockPhoto(queryCheck.value, { orientation: orientation });
+      imageBuffer = await generatePosterImage({
+        photoUrl: photo.photoUrl, hook: hookCheck.value, copy: copyCheck.value, cta: ctaCheck.value, layout: LAYOUT_POST
+      });
+    }
 
     await incrementPosterCount(req.user.id, 1);
     if (!subscribed && clientIp) {
@@ -1405,7 +1655,8 @@ app.get('/', function (req, res) {
     build: BUILD_TAG,
     docs: {
       auth: ['POST /api/auth/register', 'POST /api/auth/login', 'GET /api/auth/me'],
-      generate: 'GET /generate?query=&hook=&copy=&cta=&orientation=portrait',
+      generate: 'GET /generate?query=&hook=&copy=&cta=&orientation=portrait (or imageKey= instead of query, for a custom uploaded photo)',
+      uploads: 'POST /api/uploads/presign { contentType }',
       subscription: ['GET /api/subscription/status', 'POST /api/subscription/initiate'],
       admin: 'GET|POST /admin-limits',
       health: 'GET /ping'
@@ -1435,6 +1686,142 @@ async function loadAdminSettings() {
   }
 }
 
+// Dumps everything useful about an AWS SDK / S3-compatible error — name,
+// message, HTTP status, the provider's own error code, and the raw
+// response body if the SDK captured one. A bare err.message is often just
+// "UnknownError" or similar with zero diagnostic value on its own.
+function logS3Error(label, err) {
+  const status = err.$metadata && err.$metadata.httpStatusCode;
+  const requestId = err.$metadata && err.$metadata.requestId;
+  console.error(
+    '[storage self-test] ' + label + ' FAILED' +
+    ' — name: ' + err.name +
+    ', message: ' + err.message +
+    (status ? ', httpStatus: ' + status : '') +
+    (err.Code ? ', providerCode: ' + err.Code : '') +
+    (requestId ? ', requestId: ' + requestId : '') +
+    (err.stack ? '\n' + err.stack : '')
+  );
+}
+
+// Applies a CORS rule to the bucket automatically on startup, via the
+// S3-compatible API's PutBucketCors call — no manual dashboard/CLI step
+// needed. Requires the B2 Application Key to have the "writeBuckets"
+// capability; without it this fails with AccessDenied (logged clearly
+// below), separate from any upload-credential issue.
+//
+// UPLOAD_ALLOWED_ORIGIN controls which origin is allowed: set it to your
+// real frontend origin (e.g. https://yourapp.com) once things are working.
+// Left unset, this defaults to "*" (every origin) as requested — fine for
+// getting unblocked right now, but it means ANY website could initiate an
+// upload using a presigned URL your server issues, not just yours. Worth
+// tightening once uploads are confirmed working.
+async function configureBucketCors() {
+  if (!R2_CONFIGURED) {
+    console.log('[cors setup] skipped — storage is not configured.');
+    return;
+  }
+
+  const allowedOrigin = cleanEnvVar(process.env.UPLOAD_ALLOWED_ORIGIN) || '*';
+  if (allowedOrigin === '*') {
+    console.warn('[cors setup] WARNING: applying wildcard ("*") CORS origin — every website can initiate uploads via presigned URLs from this server, not just yours. Set UPLOAD_ALLOWED_ORIGIN to your real frontend origin once uploads are confirmed working.');
+  }
+
+  try {
+    await s3Client.send(new PutBucketCorsCommand({
+      Bucket: R2_BUCKET,
+      CORSConfiguration: {
+        CORSRules: [
+          {
+            ID: 'postira-upload-cors',
+            AllowedOrigins: [allowedOrigin],
+            AllowedMethods: ['PUT'],
+            AllowedHeaders: ['*'],
+            MaxAgeSeconds: 3600
+          }
+        ]
+      }
+    }));
+    console.log('[cors setup] PutBucketCors OK — bucket: ' + R2_BUCKET + ', allowedOrigin: ' + allowedOrigin);
+  } catch (err) {
+    logS3Error('PutBucketCors (startup CORS setup)', err);
+    if (err.name === 'AccessDenied') {
+      console.error('[cors setup] This specific failure usually means the Application Key in use does NOT have the "writeBuckets" capability. Uploading files only needs writeFiles — setting CORS needs writeBuckets too. Create/edit the Application Key in the B2 console to include it, or set CORS manually via the B2 web console instead.');
+    }
+  }
+}
+
+// Runs once at startup, entirely server-side — this deliberately skips the
+// browser and the presigned-URL flow, so it isolates whether a failure is
+// really credentials/region/bucket/permissions (this test will fail too)
+// versus a browser-only CORS block (this test will succeed even though
+// browser uploads still fail). Never blocks server startup and never
+// throws — worst case it just logs and moves on.
+async function runStorageSelfTest() {
+  if (!R2_CONFIGURED) {
+    console.log('[storage self-test] skipped — R2/B2 storage is not configured.');
+    return;
+  }
+
+  let sdkVersion = 'unknown';
+  try { sdkVersion = require('@aws-sdk/client-s3/package.json').version; } catch (e) { /* not fatal, just informational */ }
+  console.log('[storage self-test] starting — endpoint: ' + R2_ENDPOINT + ', region: ' + R2_REGION + ', bucket: ' + R2_BUCKET + ', @aws-sdk/client-s3 version: ' + sdkVersion);
+
+  // Step 1: get a real image to test with. Prefer an actual Pexels photo
+  // (as asked); fall back to a tiny generated JPEG if Pexels isn't
+  // configured or fails, so a Pexels hiccup doesn't mask a storage result.
+  let imageBuffer;
+  try {
+    if (!PEXELS_API_KEY && !PIXABAY_API_KEY) throw new Error('no stock photo API key configured');
+    const photo = await searchStockPhoto('warehouse', { orientation: 'square' });
+    console.log('[storage self-test] Pexels/Pixabay search OK — provider: ' + photo.provider + ', photoUrl: ' + photo.photoUrl);
+    const photoRes = await fetch(photo.photoUrl);
+    if (!photoRes.ok) throw new Error('download responded ' + photoRes.status);
+    imageBuffer = Buffer.from(await photoRes.arrayBuffer());
+    console.log('[storage self-test] downloaded test image OK — ' + imageBuffer.length + ' bytes');
+  } catch (err) {
+    console.error('[storage self-test] could not fetch a Pexels/Pixabay image (' + err.message + ') — falling back to a generated test image so the storage test can still run.');
+    try {
+      imageBuffer = await sharp({ create: { width: 40, height: 40, channels: 3, background: '#1564C0' } }).jpeg().toBuffer();
+    } catch (genErr) {
+      console.error('[storage self-test] ABORTED — could not even generate a fallback test image: ' + genErr.message);
+      return;
+    }
+  }
+
+  const testKey = '_healthcheck/startup-test-' + Date.now() + '.jpg';
+
+  // Step 2: direct server-side upload — the real test. If this fails, the
+  // problem is credentials, region, bucket name, or bucket permissions,
+  // NOT CORS (CORS only affects browser requests, never this).
+  try {
+    const putResult = await s3Client.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: testKey, Body: imageBuffer, ContentType: 'image/jpeg' }));
+    console.log('[storage self-test] PutObject OK — key: ' + testKey + ', ETag: ' + putResult.ETag);
+  } catch (err) {
+    logS3Error('PutObject (server-side upload)', err);
+    console.error('[storage self-test] This is a REAL storage failure, not a browser/CORS issue — check R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_REGION, R2_BUCKET, and that this Application Key has write access to this bucket.');
+    return; // no point testing read-back/delete if the upload itself failed
+  }
+
+  // Step 3: read it back, to confirm the key we wrote is the key we can read.
+  try {
+    const head = await s3Client.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: testKey }));
+    console.log('[storage self-test] HeadObject OK — ContentLength: ' + head.ContentLength);
+  } catch (err) {
+    logS3Error('HeadObject (read-back)', err);
+  }
+
+  // Step 4: clean up the test object either way — best-effort.
+  try {
+    await s3Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: testKey }));
+    console.log('[storage self-test] cleanup OK — test object deleted.');
+  } catch (err) {
+    logS3Error('DeleteObject (cleanup)', err);
+  }
+
+  console.log('[storage self-test] finished.');
+}
+
 mongoose.connection.once('open', async function () {
   try {
     await loadAdminSettings();
@@ -1451,6 +1838,20 @@ mongoose.connection.once('open', async function () {
     app.listen(PORT, function () {
       console.log('Marketing poster generator (image only) running on port ' + PORT + ' | Domain: https://' + DOMAIN);
     });
+
+    // Fire-and-forget: never blocks the server from starting or accepting
+    // requests. CORS setup runs first so the self-test's timing (and any
+    // real browser upload attempts) happen after the rule is in place.
+    configureBucketCors()
+      .catch(function (err) {
+        console.error('[cors setup] unexpected error applying CORS:', err);
+      })
+      .then(function () {
+        return runStorageSelfTest();
+      })
+      .catch(function (err) {
+        console.error('[storage self-test] unexpected error running the test itself:', err);
+      });
   } catch (err) {
     console.error('FATAL: startup sequence failed, exiting:', err.message);
     process.exit(1);
